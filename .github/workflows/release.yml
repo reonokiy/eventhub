@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      release_exists: ${{ steps.release-state.outputs.exists }}
+    permissions:
+      contents: read
+    env:
+      EVENTHUB_TEST_DATABASE_URL: postgres://eventhub:eventhub@127.0.0.1:5432/eventhub_test
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: eventhub
+          POSTGRES_PASSWORD: eventhub
+          POSTGRES_DB: eventhub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eventhub -d eventhub_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Validate tag and package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=commonjs -e '
+            const fs = require("node:fs");
+            const tag = process.env.RELEASE_TAG;
+            const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const packageLock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+            const exactStableTag = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+            if (typeof tag !== "string" || !exactStableTag.test(tag)) {
+              throw new Error("Release tag must exactly match vX.Y.Z without leading zeroes or prerelease suffixes");
+            }
+
+            const packageVersion = packageJson.version;
+            const lockVersion = packageLock.version;
+            const lockRootVersion = packageLock.packages && packageLock.packages[""]
+              ? packageLock.packages[""].version
+              : undefined;
+
+            if (tag !== "v" + packageVersion) {
+              throw new Error("Release tag " + tag + " does not match package.json version " + packageVersion);
+            }
+            if (lockVersion !== packageVersion || lockRootVersion !== packageVersion) {
+              throw new Error("package.json and package-lock.json versions must match before release");
+            }
+
+            process.stdout.write("Validated release " + tag + "\n");
+          '
+
+      - name: Check whether the GitHub Release already exists
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if release_error="$(
+            gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --silent 2>&1
+          )"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub Release $RELEASE_TAG already exists; publish jobs will be skipped."
+          elif [[ "$release_error" == *"(HTTP 404)"* ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$release_error" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check application
+        run: npm run typecheck
+
+      - name: Type-check tests
+        run: npm run typecheck:test
+
+      - name: Run tests with 100% coverage
+        run: npm run test:coverage
+
+      - name: Build application
+        run: npm run build
+
+      - name: Build container image
+        run: docker build --tag eventhub:release-check .
+
+  publish-image:
+    name: Publish multi-platform image
+    needs: validate
+    if: ${{ needs.validate.outputs.release_exists != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          annotations: ${{ steps.metadata.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+
+  create-release:
+    name: Create GitHub Release
+    needs:
+      - validate
+      - publish-image
+    if: ${{ needs.validate.outputs.release_exists != 'true' && needs.publish-image.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create release if absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IMAGE_DIGEST: ${{ needs.publish-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if release_error="$(
+            gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --silent 2>&1
+          )"; then
+            echo "GitHub Release $RELEASE_TAG already exists; leaving it unchanged."
+            exit 0
+          elif [[ "$release_error" != *"(HTTP 404)"* ]]; then
+            printf '%s\n' "$release_error" >&2
+            exit 1
+          fi
+
+          image="ghcr.io/${GH_REPO,,}"
+          version="${RELEASE_TAG#v}"
+          printf -v release_notes 'Container image: %s:%s\n\nImmutable digest: %s@%s' \
+            "$image" "$version" "$image" "$IMAGE_DIGEST"
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
+            --verify-tag \
+            --generate-notes \
+            --notes "$release_notes"

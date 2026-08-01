@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-eventhub}
+      POSTGRES_USER: ${POSTGRES_USER:-eventhub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eventhub}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - eventhub-postgres-18-v01:/var/lib/postgresql
+
+  eventhub:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # This file defaults to a localhost-only development runtime. Production
+      # deploys must explicitly set NODE_ENV=production and inject unique secrets.
+      NODE_ENV: ${NODE_ENV:-development}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgres://eventhub:eventhub@postgres:5432/eventhub}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+      DATABASE_CONNECTION_TIMEOUT_MS: ${DATABASE_CONNECTION_TIMEOUT_MS:-5000}
+      DATABASE_QUERY_TIMEOUT_MS: ${DATABASE_QUERY_TIMEOUT_MS:-30000}
+      MIGRATE_ON_START: ${MIGRATE_ON_START:-true}
+      BOOTSTRAP_TENANT_ID: ${BOOTSTRAP_TENANT_ID:-00000000-0000-4000-8000-000000000001}
+      BOOTSTRAP_TENANT_NAME: ${BOOTSTRAP_TENANT_NAME:-Default tenant}
+      # These fallbacks exist solely for local development. The application
+      # refuses to start with any of them when NODE_ENV=production.
+      BOOTSTRAP_API_KEY: ${BOOTSTRAP_API_KEY:-dev-api-key-change-me}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-api-key-change-me}
+      BOOTSTRAP_WEBHOOK_CONNECTION_ID: ${BOOTSTRAP_WEBHOOK_CONNECTION_ID:-00000000-0000-4000-8000-000000000002}
+      BOOTSTRAP_WEBHOOK_SECRET: ${BOOTSTRAP_WEBHOOK_SECRET:-dev-webhook-secret-change-me}
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-30}
+      MAX_EVENT_BYTES: ${MAX_EVENT_BYTES:-1048576}
+      SSE_BATCH_SIZE: ${SSE_BATCH_SIZE:-200}
+      SSE_POLL_INTERVAL_MS: ${SSE_POLL_INTERVAL_MS:-5000}
+      SSE_HEARTBEAT_INTERVAL_MS: ${SSE_HEARTBEAT_INTERVAL_MS:-15000}
+      SSE_WRITE_TIMEOUT_MS: ${SSE_WRITE_TIMEOUT_MS:-30000}
+      WEBHOOK_MAX_CLOCK_SKEW_SECONDS: ${WEBHOOK_MAX_CLOCK_SKEW_SECONDS:-300}
+    ports:
+      - "${EVENTHUB_BIND_ADDRESS:-127.0.0.1}:${EVENTHUB_PORT:-3000}:${PORT:-3000}"
+
+volumes:
+  eventhub-postgres-18-v01:

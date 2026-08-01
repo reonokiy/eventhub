@@ -1,0 +1,24 @@
+{
+  "all": true,
+  "include": ["src/**/*.ts"],
+  "exclude": [
+    "src/server.ts",
+    "src/cli/**",
+    "src/db/index.ts",
+    "src/db/schema.ts",
+    "src/db/types.ts",
+    "src/service/connections.ts",
+    "src/service/event-store.ts"
+  ],
+  "extension": [".ts"],
+  "exclude-after-remap": true,
+  "check-coverage": true,
+  "per-file": true,
+  "statements": 100,
+  "branches": 100,
+  "functions": 100,
+  "lines": 100,
+  "reporter": ["text", "lcov", "json-summary"],
+  "reports-dir": "coverage",
+  "temp-directory": "coverage/tmp"
+}
